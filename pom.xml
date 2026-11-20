@@ -1,0 +1,142 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.example.fanin</groupId>
+  <artifactId>fanin-connector</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+  <name>fanin-connector</name>
+  <description>Kafka Connect sink that fans records from many topics (topics.regex) into one topic.</description>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- Confluent Cloud custom connector runtime 4.2 = Apache Kafka 4.2.0, Java 17 and 21 -->
+    <maven.compiler.release>17</maven.compiler.release>
+    <kafka.version>4.2.0</kafka.version>
+    <slf4j.version>2.0.16</slf4j.version>
+    <junit.version>5.11.4</junit.version>
+    <it.excludedGroups>integration,cloud</it.excludedGroups>
+  </properties>
+
+  <dependencies>
+    <!-- Supplied by the Connect runtime, so not bundled in lib/. -->
+    <dependency>
+      <groupId>org.apache.kafka</groupId>
+      <artifactId>connect-api</artifactId>
+      <version>${kafka.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.apache.kafka</groupId>
+      <artifactId>kafka-clients</artifactId>
+      <version>${kafka.version}</version>
+      <scope>provided</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-api</artifactId>
+      <version>${slf4j.version}</version>
+      <scope>provided</scope>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.18.2</version>
+      <scope>test</scope>
+    </dependency>
+    <dependency>
+      <groupId>org.slf4j</groupId>
+      <artifactId>slf4j-simple</artifactId>
+      <version>${slf4j.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <resources>
+      <resource>
+        <directory>src/main/resources</directory>
+        <filtering>true</filtering>
+        <includes>
+          <include>version.properties</include>
+        </includes>
+      </resource>
+    </resources>
+
+    <plugins>
+      <plugin>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.5.2</version>
+        <configuration>
+          <!-- Integration tests (tag "integration") need the docker stack; run them with scripts/local-it.sh. -->
+          <excludedGroups>${it.excludedGroups}</excludedGroups>
+        </configuration>
+      </plugin>
+
+      <plugin>
+        <groupId>org.jacoco</groupId>
+        <artifactId>jacoco-maven-plugin</artifactId>
+        <version>0.8.13</version>
+        <executions>
+          <execution>
+            <goals><goal>prepare-agent</goal></goals>
+          </execution>
+          <execution>
+            <id>report</id>
+            <phase>verify</phase>
+            <goals><goal>report</goal></goals>
+          </execution>
+        </executions>
+      </plugin>
+
+      <!-- Builds the Confluent-style plugin archive: manifest.json, lib/, etc/, doc/, assets/ -->
+      <plugin>
+        <groupId>io.confluent</groupId>
+        <artifactId>kafka-connect-maven-plugin</artifactId>
+        <version>0.12.0</version>
+        <executions>
+          <execution>
+            <phase>package</phase>
+            <goals><goal>kafka-connect</goal></goals>
+            <configuration>
+              <title>Fan-in Sink Connector</title>
+              <description>Sink connector that subscribes to many topics by regex (topics.regex) and writes every record to a single target topic, so a consumer such as Confluent Cloud for Apache Flink can read one static topic.</description>
+              <ownerUsername>example</ownerUsername>
+              <ownerType>organization</ownerType>
+              <ownerName>Example</ownerName>
+              <ownerUrl>https://example.com</ownerUrl>
+              <componentTypes>
+                <componentType>sink</componentType>
+              </componentTypes>
+              <confluentControlCenterIntegration>false</confluentControlCenterIntegration>
+              <singleMessageTransforms>false</singleMessageTransforms>
+              <kafkaConnectApi>true</kafkaConnectApi>
+              <supportedEncodings>
+                <supportedEncoding>UTF-8</supportedEncoding>
+              </supportedEncodings>
+              <supportProviderName>Example</supportProviderName>
+              <supportSummary>Proof of concept. Customer-owned code, not supported by Confluent.</supportSummary>
+              <sourceUrl>https://example.com/fanin-connector</sourceUrl>
+              <logo>assets/fanin.svg</logo>
+              <documentationUrl>https://example.com/fanin-connector</documentationUrl>
+              <tags>
+                <tag>fan-in</tag>
+                <tag>kafka</tag>
+              </tags>
+            </configuration>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -1,0 +1,11 @@
+target/
+*.secret
+.env
+.env.*
+*.local.json
+cc-state/
+.DS_Store
+.idea/
+*.iml
+.vscode/
+docs/
