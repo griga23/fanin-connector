@@ -4,10 +4,6 @@ A Kafka Connect **sink** connector that subscribes to many topics (selected by a
 record to **one** target topic on the same cluster. A reader that needs a single static topic, such as Confluent Cloud
 for Apache Flink, can then read the fan-in topic instead of a changing list of topics.
 
-This is a workaround and a proof of concept for a customer that reads 1,000 to 2,000 topics, changing daily, with the
-Flink Kafka connector. It is not a product feature. The code is owned by whoever deploys it; Confluent supports the
-Connect platform it runs on, not the connector.
-
 Measured results are in `docs/FINDINGS.md` (kept local, not published). Read its "Open questions" table first.
 
 ## Architecture
