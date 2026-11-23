@@ -188,7 +188,17 @@ public class FanInSinkTask extends SinkTask {
         if (partitioningMode == FanInSinkConfig.PartitioningMode.SOURCE_PARTITION_HASH) {
             partition = selectPartition(record.topic(), record.kafkaPartition(), partitionCount());
         }
-        return new ProducerRecord<>(targetTopic, partition, null, key, outValue, headers);
+        return new ProducerRecord<>(targetTopic, partition, outputTimestamp(record.timestamp()), key, outValue,
+            headers);
+    }
+
+    /**
+     * Keeps the source record's timestamp, so readers that use the Kafka timestamp as event time (for example
+     * Flink's {@code $rowtime}) see the original time and not the time of the copy. Returns null, so the producer
+     * sets the current time, when the source record has no timestamp. KafkaProducer rejects negative values.
+     */
+    static Long outputTimestamp(Long sourceTimestamp) {
+        return sourceTimestamp != null && sourceTimestamp >= 0 ? sourceTimestamp : null;
     }
 
     /** Stable partition for a source topic-partition, always within [0, numPartitions). */
