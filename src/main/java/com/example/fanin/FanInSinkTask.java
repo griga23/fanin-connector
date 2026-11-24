@@ -10,6 +10,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
+import org.apache.kafka.clients.admin.Admin;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
@@ -57,6 +58,11 @@ public class FanInSinkTask extends SinkTask {
     /** First asynchronous send failure; sticky, so the task fails and offsets are never committed past it. */
     private final AtomicReference<Throwable> sendFailure = new AtomicReference<>();
 
+    private long startTimestamp = -1L;
+    private String consumerGroup;
+    private String clientId;
+    private StartOffsets.Lookup startLookup;
+
     private int cachedPartitionCount;
     private long partitionCountFetchedAt;
     LongSupplier clock = System::currentTimeMillis;
@@ -74,12 +80,54 @@ public class FanInSinkTask extends SinkTask {
         }
 
         Map<String, Object> producerConfigs = config.producerConfigs();
-        String clientId = "fanin-" + props.getOrDefault("name", "connector") + "-"
+        clientId = "fanin-" + props.getOrDefault("name", "connector") + "-"
             + props.getOrDefault(FanInSinkConnector.TASK_INDEX, "0");
+        startTimestamp = config.startTimestamp();
+        consumerGroup = config.startConsumerGroup(props.getOrDefault("name", "connector"));
         producerConfigs.putIfAbsent("client.id", clientId);
         producer = createProducer(producerConfigs);
         log.info("Started fan-in task: target topic {}, output mode {}, partitioning {}",
             targetTopic, outputMode, partitioningMode);
+    }
+
+    /**
+     * Moves partitions that have no committed offset to the configured start timestamp. Runs when partitions are
+     * assigned, which includes every new topic and every rebalance. Partitions with a committed offset are never
+     * touched. A failure is logged and the task carries on with the consumer's own reset policy: stopping would not
+     * help, and the worst case is the behaviour without this setting.
+     */
+    @Override
+    public void open(Collection<TopicPartition> partitions) {
+        if (startTimestamp < 0 || partitions.isEmpty()) {
+            return;
+        }
+        try {
+            if (startLookup == null) {
+                startLookup = createStartLookup(config.adminConfigs());
+            }
+            Map<TopicPartition, Long> moves =
+                StartOffsets.compute(startLookup, consumerGroup, partitions, startTimestamp);
+            if (!moves.isEmpty()) {
+                context.offset(moves);
+                log.info("Start timestamp {}: moved {} of {} assigned partitions without a committed offset",
+                    startTimestamp, moves.size(), partitions.size());
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.warn("Interrupted while applying the start timestamp; partitions keep their default start");
+        } catch (Exception | LinkageError e) {
+            // LinkageError (for example NoSuchMethodError) covers a client library that differs from the one this
+            // was built against. An optional feature must never be able to kill the task.
+            log.warn("Could not apply the start timestamp {} for group {}; partitions keep their default start: {}",
+                startTimestamp, consumerGroup, e.toString());
+        }
+    }
+
+    /** Overridable so tests can inject a fake lookup. */
+    StartOffsets.Lookup createStartLookup(Map<String, Object> adminConfigs) {
+        Map<String, Object> configs = new java.util.HashMap<>(adminConfigs);
+        configs.putIfAbsent("client.id", clientId + "-admin");
+        return new AdminLookup(Admin.create(configs));
     }
 
     /** Overridable so tests can inject a MockProducer. */
@@ -119,6 +167,15 @@ public class FanInSinkTask extends SinkTask {
 
     @Override
     public void stop() {
+        StartOffsets.Lookup lookup = startLookup;
+        startLookup = null;
+        if (lookup != null) {
+            try {
+                lookup.close();
+            } catch (RuntimeException e) {
+                log.warn("Closing the admin client failed: {}", e.toString());
+            }
+        }
         Producer<byte[], byte[]> p = producer;
         producer = null;
         if (p == null) {

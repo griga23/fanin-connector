@@ -687,6 +687,169 @@ class LocalIT {
         System.out.println("RESULT " + id + " " + message);
     }
 
+    // ------------------------------------------------------------------ L10-L14: fanin.start.timestamp
+
+    static byte[] utf8(String s) {
+        return s.getBytes(StandardCharsets.UTF_8);
+    }
+
+    static List<String> values(List<ConsumerRecord<byte[], byte[]>> records) {
+        List<String> out = new ArrayList<>();
+        records.forEach(r -> out.add(new String(r.value(), StandardCharsets.UTF_8)));
+        return out;
+    }
+
+    static void produce(String topic, String valuePrefix, int count) throws Exception {
+        for (int i = 0; i < count; i++) {
+            send(topic, i % 2, null, utf8(valuePrefix + i), null);
+        }
+        producer.flush();
+    }
+
+    /** Sum of the offsets the connector's consumer group has committed on a topic. */
+    static long committedOn(String group, String topic) throws Exception {
+        long sum = 0;
+        for (var e : admin.listConsumerGroupOffsets(group).partitionsToOffsetAndMetadata().get().entrySet()) {
+            if (e.getKey().topic().equals(topic)) {
+                sum += e.getValue().offset();
+            }
+        }
+        return sum;
+    }
+
+    /** Topic with an old backlog, then a point in time, then newer records. Returns the point in time. */
+    static long backlogThenNow(String topic, int oldCount, int newCount) throws Exception {
+        produce(topic, "old-", oldCount);
+        settle(1_500);
+        long t = System.currentTimeMillis();
+        settle(300);
+        produce(topic, "new-", newCount);
+        return t;
+    }
+
+    @Test
+    void l10_startTimestampSkipsTheBacklog() throws Exception {
+        String p = prefix("l10", FanInSinkConfig.OutputMode.HEADERS);
+        String target = p + "-out";
+        createTopic(p + ".a", 2);
+        createTopic(target, 3);
+        long t = backlogThenNow(p + ".a", 100, 50);
+
+        startConnector(p, regex(p), target, FanInSinkConfig.OutputMode.HEADERS, 1,
+            Map.of("fanin.start.timestamp", Long.toString(t)));
+
+        consume(target, 50, 60_000);
+        settle(5_000);
+        List<String> out = values(consume(target, 50, 5_000));
+        assertEquals(50, out.size(), "only the records after the start timestamp");
+        assertTrue(out.stream().allMatch(v -> v.startsWith("new-")), "no record from the old backlog: " + out);
+        log("L10", "PASS: 100 old records skipped, the 50 records after the start timestamp delivered");
+    }
+
+    @Test
+    void l11_restartResumesFromCommittedOffsetsAndDoesNotRewind() throws Exception {
+        String p = prefix("l11", FanInSinkConfig.OutputMode.HEADERS);
+        String target = p + "-out";
+        createTopic(p + ".a", 2);
+        createTopic(target, 3);
+        long t0 = System.currentTimeMillis() - 60_000; // far before every record: a rewind would replay everything
+        startConnector(p, regex(p), target, FanInSinkConfig.OutputMode.HEADERS, 1,
+            Map.of("fanin.start.timestamp", Long.toString(t0)));
+
+        produce(p + ".a", "first-", 60);
+        consume(target, 60, 60_000);
+        await("offsets of the 60 records committed", 60_000, () -> {
+            try {
+                return committedOn("connect-" + p, p + ".a") >= 60;
+            } catch (Exception e) {
+                return false;
+            }
+        });
+
+        HttpResponse<String> restart = http("POST", "/connectors/" + p + "/restart?includeTasks=true&onlyFailed=false",
+            null);
+        assertTrue(restart.statusCode() < 300, "restart failed: " + restart.statusCode() + " " + restart.body());
+        await("tasks running after restart", 60_000, () -> allTasksRunning(p, 1));
+        produce(p + ".a", "second-", 20);
+
+        consume(target, 80, 60_000);
+        settle(5_000);
+        List<ConsumerRecord<byte[], byte[]>> out = consume(target, 80, 5_000);
+        Set<String> origins = new HashSet<>();
+        out.forEach(r -> origins.add(header(r, "fanin.source.partition") + "@" + header(r, "fanin.source.offset")));
+        assertEquals(80, out.size(), "no replay after the restart and no loss");
+        assertEquals(80, origins.size(), "no duplicates");
+        log("L11", "PASS: after a restart the connector resumed at the committed offsets: 80 records, 0 duplicates, "
+            + "although the start timestamp lies before every record");
+    }
+
+    @Test
+    void l12_newTopicIsReadFromItsFirstRecordEvenWithOffsetResetLatest() throws Exception {
+        String p = prefix("l12", FanInSinkConfig.OutputMode.HEADERS);
+        String target = p + "-out";
+        createTopic(p + ".a", 1);
+        createTopic(target, 3);
+        long t = System.currentTimeMillis();
+        // metadata.max.age.ms is 5 s in these tests, so the new topic is found a few seconds after it is created.
+        startConnector(p, regex(p), target, FanInSinkConfig.OutputMode.HEADERS, 1,
+            Map.of("fanin.start.timestamp", Long.toString(t), "consumer.override.auto.offset.reset", "latest"));
+        send(p + ".a", null, null, utf8("warmup"), null);
+        producer.flush();
+        consume(target, 1, 60_000);
+
+        createTopic(p + ".d", 2);
+        produce(p + ".d", "late-", 20); // produced before the connector has found the topic
+        List<String> out = values(consume(target, 21, 90_000));
+        long late = out.stream().filter(v -> v.startsWith("late-")).count();
+        assertEquals(20, late, "records produced before the topic was discovered must not be skipped");
+        log("L12", "PASS: with auto.offset.reset=latest the 20 records of a new topic were still delivered "
+            + "from the first record");
+    }
+
+    @Test
+    void l13_recreatedConnectorStartsAtTheTimestampNotAtTheBeginning() throws Exception {
+        String p = prefix("l13", FanInSinkConfig.OutputMode.HEADERS);
+        String target = p + "-out";
+        createTopic(p + ".a", 2);
+        createTopic(target, 3);
+        long t = backlogThenNow(p + ".a", 30, 20);
+        Map<String, String> extra = Map.of("fanin.start.timestamp", Long.toString(t));
+
+        startConnector(p + "x", regex(p), target, FanInSinkConfig.OutputMode.HEADERS, 1, extra);
+        consume(target, 20, 60_000);
+        http("DELETE", "/connectors/" + p + "x", null);
+        settle(3_000);
+        startConnector(p + "y", regex(p), target, FanInSinkConfig.OutputMode.HEADERS, 1, extra); // new group
+
+        consume(target, 40, 60_000);
+        settle(5_000);
+        List<String> out = values(consume(target, 40, 5_000));
+        assertEquals(40, out.size(), "the 20 new records twice (a new group has no offsets), none of the 30 old ones");
+        assertTrue(out.stream().allMatch(v -> v.startsWith("new-")), "no record before the timestamp: " + out);
+        log("L13", "PASS: a recreated connector (new group) replayed only from the start timestamp: 40 = 20 + 20 "
+            + "duplicates, 0 of the 30 old records");
+    }
+
+    @Test
+    void l14_wrongGroupNameIsIgnoredWithoutRewinding() throws Exception {
+        String p = prefix("l14", FanInSinkConfig.OutputMode.HEADERS);
+        String target = p + "-out";
+        createTopic(p + ".a", 2);
+        createTopic(target, 3);
+        long t = backlogThenNow(p + ".a", 30, 20);
+
+        startConnector(p, regex(p), target, FanInSinkConfig.OutputMode.HEADERS, 1,
+            Map.of("fanin.start.timestamp", Long.toString(t), "fanin.start.consumer.group", "no-such-group"));
+
+        consume(target, 50, 60_000);
+        settle(5_000);
+        List<String> out = values(consume(target, 50, 5_000));
+        assertEquals(50, out.size(), "unknown group: the setting is ignored and the default start (earliest) applies");
+        assertFalse(taskFailed(p), "the task must not fail because of the unknown group");
+        log("L14", "PASS: an unknown consumer group name is ignored (warning), the task keeps running and "
+            + "starts from the default position");
+    }
+
     @Test
     void zz_sanityNoLeftoverFailedConnectors() throws Exception {
         // every connector created by this class is deleted in @AfterEach; assert the worker is still healthy

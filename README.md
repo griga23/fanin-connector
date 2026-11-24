@@ -47,6 +47,8 @@ Connector properties (all are in the connector's ConfigDef, so Confluent Cloud s
 | `fanin.target.api.secret` | password | required | The API secret. Marked sensitive. |
 | `fanin.output.mode` | enum | `HEADERS` | `HEADERS` or `JSON_ENVELOPE`, see below. |
 | `fanin.partitioning.mode` | enum | `SOURCE_PARTITION_HASH` | `SOURCE_PARTITION_HASH` or `KEY_HASH`, see below. |
+| `fanin.start.timestamp` | long | `-1` (off) | Epoch milliseconds. Partitions without a committed offset start at the first record at or after this time instead of at the beginning, see "Where reading starts". |
+| `fanin.start.consumer.group` | string | `connect-<connector name>` | Consumer group used to find the partitions without a committed offset. Set it if the group has another name. |
 | `fanin.producer.*` | passthrough | none | Extra producer settings with the prefix removed, for example `fanin.producer.compression.type=lz4` or `fanin.producer.max.request.size=4194304`. They override the defaults below. |
 
 Producer defaults: `acks=all`, `enable.idempotence=true`, `security.protocol=SASL_SSL`, `sasl.mechanism=PLAIN`
@@ -93,6 +95,39 @@ Measured: after killing the worker mid-stream there was no loss and about 3,000 
 
 Ordering: preserved within one source partition. Not preserved across source partitions.
 
+## Where reading starts
+
+By default the framework starts a partition at the beginning of the topic when its consumer group has no committed
+offset for it. That happens on the first deployment, for every newly discovered topic, and after the connector was
+deleted and created again. To avoid reading old backlog, set `fanin.start.timestamp` to an epoch time in milliseconds.
+
+- A partition **with** a committed offset always resumes from it. A restart, a pause and resume or an update in place
+  never rewind. This is covered by test L11 (80 records, 0 duplicates, with the timestamp far before every record).
+- A partition **without** a committed offset starts at the first record whose timestamp is at or after the setting.
+  A topic that is created after that time is therefore read from its first record, even though it is only found a few
+  minutes later and even with `consumer.override.auto.offset.reset=latest` (test L12).
+- A partition that has no record at or after the setting starts at its end.
+- **Recreating the connector** starts a new group, so every partition is positioned by the timestamp again. Everything
+  since the timestamp is delivered a second time (test L13: 20 records twice, none of the 30 older ones). Keep the
+  old timestamp to lose nothing and accept the duplicates, or set a later one to cut the duplicates and accept a gap.
+- The offsets are looked up with an Admin client built from the `fanin.target.*` settings. The source topics must
+  therefore be on the same cluster as the target topic. The lookup needs read access to the consumer group.
+- If the group cannot be found or the lookup fails, the setting is ignored, a warning is logged and the default start
+  applies. The task does not fail (test L14, and a test for a client library that lacks a method). On Confluent Cloud
+  the group is `connect-<connector id>` and the task's `name` is that same ID, so the default group name is right
+  there without setting `fanin.start.consumer.group` (checked on Cloud, see below).
+- **Checked on Confluent Cloud** (Azure germanywestcentral, BASIC cluster, runtime 4.2, 2026-11-24): with the setting
+  the task moved 3 of 3 partitions without a committed offset (to offsets 30, 31 and 39, the 100 older records
+  skipped), the target received exactly the 50 newer records, an in-place update then resumed without replay (20
+  more records, no duplicates), and 20 records of a topic created after the start arrived with
+  `consumer.override.auto.offset.reset=latest`. The Admin client works with the connector's API key.
+- The Cloud runtime's Kafka client has no `ConsumerGroupDescription.groupState()`. The lookup uses only methods that
+  older clients have, and the task catches `LinkageError`, so a missing method cannot kill it.
+- Alternative without connector code: Kafka 4.x consumers accept `auto.offset.reset=by_duration:<ISO 8601 duration>`,
+  for example `by_duration:PT1H`, which starts uncommitted partitions that long before the moment of the reset. It is a
+  moving window and not a fixed time. Whether Confluent Cloud accepts that value for
+  `consumer.override.auto.offset.reset` has not been tested.
+
 ## Limitations
 
 Measured on Confluent Cloud (Azure <azure-region>, STANDARD cluster, runtime 4.2); details and numbers in
@@ -104,8 +139,8 @@ Measured on Confluent Cloud (Azure <azure-region>, STANDARD cluster, runtime 4.2
   `tasks.max=4` one task stayed idle in the local test. Cloud rejects `consumer.override.partition.assignment.strategy`,
   so the round-robin assignor cannot be used there. Choose `tasks.max` with this in mind.
 - **Redeploying duplicates everything.** The consumer group is named after the connector ID (`connect-<clcc-id>`).
-  Deleting and recreating the connector starts a new group from the earliest offset and delivers all topics again.
-  Update the connector in place instead. Connectors cannot be restarted from the Console or the Restart API.
+  Deleting and recreating the connector starts a new group from the earliest offset (or from `fanin.start.timestamp`
+  if set) and delivers those records again. Update the connector in place instead. Connectors cannot be restarted from the Console or the Restart API.
 - **Record size.** Default producer limit is 1 MiB (`fanin.producer.max.request.size`). A larger record fails the task
   with `RecordTooLargeException` until the limit is raised. The target topic's `max.message.bytes` (about 2 MiB by
   default on Cloud) limits too. A 2,000,000-byte record worked after raising the producer limit to 4 MiB.
