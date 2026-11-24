@@ -26,6 +26,8 @@ public class FanInSinkConfig extends AbstractConfig {
     public static final String TARGET_API_SECRET = "fanin.target.api.secret";
     public static final String OUTPUT_MODE = "fanin.output.mode";
     public static final String PARTITIONING_MODE = "fanin.partitioning.mode";
+    public static final String START_TIMESTAMP = "fanin.start.timestamp";
+    public static final String START_CONSUMER_GROUP = "fanin.start.consumer.group";
     /** Prefix for pass-through producer settings, e.g. fanin.producer.compression.type. */
     public static final String PRODUCER_PREFIX = "fanin.producer.";
 
@@ -74,7 +76,23 @@ public class FanInSinkConfig extends AbstractConfig {
             "SOURCE_PARTITION_HASH: the target partition is murmur2(sourceTopic-sourcePartition) modulo the "
                 + "partition count of the target topic, which keeps per-source-partition ordering even for null "
                 + "keys. KEY_HASH: the default producer partitioner decides from the record key.",
-            GROUP_BEHAVIOUR, 2, Width.MEDIUM, "Partitioning mode");
+            GROUP_BEHAVIOUR, 2, Width.MEDIUM, "Partitioning mode")
+        .define(START_TIMESTAMP, Type.LONG, -1L, ConfigDef.Range.atLeast(-1L),
+            Importance.MEDIUM,
+            "Epoch milliseconds. Partitions that have no committed offset in the connector's consumer group start "
+                + "at the first record with a timestamp at or after this value, instead of at the beginning of "
+                + "the topic. This covers the first deployment, newly discovered topics and a recreated "
+                + "connector. Partitions with a committed offset always resume from it. A partition with no "
+                + "record at or after the value starts at its end. -1 turns this off and leaves the choice to "
+                + "auto.offset.reset. The source topics must be on the cluster of the target topic, because "
+                + "the lookup uses the target cluster settings.",
+            GROUP_BEHAVIOUR, 3, Width.MEDIUM, "Start timestamp")
+        .define(START_CONSUMER_GROUP, Type.STRING, "", Importance.LOW,
+            "Consumer group of the connector, used to find which partitions have a committed offset. Empty means "
+                + "connect-<connector name>, the Kafka Connect default. Set it if the connector's group differs, "
+                + "for example when group.id is overridden. If the group cannot be found, the start timestamp is "
+                + "ignored and a warning is logged.",
+            GROUP_BEHAVIOUR, 4, Width.MEDIUM, "Start consumer group");
 
     public FanInSinkConfig(Map<String, ?> originals) {
         super(CONFIG_DEF, originals, false);
@@ -90,6 +108,30 @@ public class FanInSinkConfig extends AbstractConfig {
 
     public OutputMode outputMode() {
         return OutputMode.valueOf(getString(OUTPUT_MODE).toUpperCase(Locale.ROOT));
+    }
+
+    /** Start timestamp in epoch milliseconds, or -1 if off. */
+    public long startTimestamp() {
+        return getLong(START_TIMESTAMP);
+    }
+
+    /** Consumer group of this connector, {@code connect-<name>} unless configured. */
+    public String startConsumerGroup(String connectorName) {
+        String configured = getString(START_CONSUMER_GROUP);
+        return configured == null || configured.isBlank() ? "connect-" + connectorName : configured;
+    }
+
+    /** Admin client settings: the connection part of the producer settings, for the same cluster. */
+    public Map<String, Object> adminConfigs() {
+        Map<String, Object> admin = new HashMap<>();
+        for (Map.Entry<String, Object> e : producerConfigs().entrySet()) {
+            String key = e.getKey();
+            if (key.startsWith("bootstrap.") || key.startsWith("security.") || key.startsWith("sasl.")
+                || key.startsWith("ssl.") || key.equals("client.dns.lookup")) {
+                admin.put(key, e.getValue());
+            }
+        }
+        return admin;
     }
 
     public PartitioningMode partitioningMode() {
