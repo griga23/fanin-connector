@@ -850,6 +850,50 @@ class LocalIT {
             + "starts from the default position");
     }
 
+    // ------------------------------------------------------------------ L15, L16: fanin.timestamp.mode
+
+    /** 2026-01-01T00:00Z: far in the past compared with the time of the test. */
+    static final long OLD_TS = 1_767_225_600_000L;
+
+    List<ConsumerRecord<byte[], byte[]>> copyThreeRecordsWithTimestamp(String test, Map<String, String> extra)
+        throws Exception {
+        String p = prefix(test, FanInSinkConfig.OutputMode.HEADERS);
+        String target = p + "-out";
+        createTopic(p + ".a", 1);
+        createTopic(target, 1);
+        startConnector(p, regex(p), target, FanInSinkConfig.OutputMode.HEADERS, 1, extra);
+        for (int i = 0; i < 3; i++) {
+            producer.send(new org.apache.kafka.clients.producer.ProducerRecord<>(p + ".a", 0, OLD_TS, null,
+                utf8("v" + i))).get();
+        }
+        producer.flush();
+        // the broker deletes records with old timestamps soon, so read at once
+        List<ConsumerRecord<byte[], byte[]>> out = consume(target, 3, 60_000);
+        assertEquals(3, out.size());
+        out.forEach(r -> assertEquals(Long.toString(OLD_TS), header(r, "fanin.source.timestamp"),
+            "the header keeps the original time in every mode"));
+        return out;
+    }
+
+    @Test
+    void l15_timestampModeSourceKeepsTheSourceTime() throws Exception {
+        List<ConsumerRecord<byte[], byte[]>> out = copyThreeRecordsWithTimestamp("l15", Map.of());
+        out.forEach(r -> assertEquals(OLD_TS, r.timestamp(), "default SOURCE: the source timestamp is kept"));
+        log("L15", "PASS: default timestamp mode SOURCE kept the source timestamp " + OLD_TS + " on all 3 records");
+    }
+
+    @Test
+    void l16_timestampModeCopyUsesTheTimeOfTheCopy() throws Exception {
+        long before = System.currentTimeMillis();
+        List<ConsumerRecord<byte[], byte[]>> out =
+            copyThreeRecordsWithTimestamp("l16", Map.of("fanin.timestamp.mode", "COPY"));
+        long after = System.currentTimeMillis();
+        out.forEach(r -> assertTrue(r.timestamp() >= before && r.timestamp() <= after,
+            "COPY: the timestamp is the time of the copy, was " + r.timestamp() + " not in [" + before + ", " + after
+                + "]"));
+        log("L16", "PASS: timestamp mode COPY gave the time of the copy on all 3 records, the header kept " + OLD_TS);
+    }
+
     @Test
     void zz_sanityNoLeftoverFailedConnectors() throws Exception {
         // every connector created by this class is deleted in @AfterEach; assert the worker is still healthy

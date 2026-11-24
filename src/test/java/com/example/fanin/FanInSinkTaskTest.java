@@ -204,6 +204,58 @@ class FanInSinkTaskTest {
         assertNull(task.mock.history().get(0).timestamp(), "KafkaProducer rejects a negative timestamp");
     }
 
+    // ---- timestamp mode ----
+
+    @Test
+    void timestampModeDefaultsToSource() {
+        assertEquals(FanInSinkConfig.TimestampMode.SOURCE, new FanInSinkConfig(props()).timestampMode());
+        TestTask task = started(true);
+        task.put(List.of(record("pfx.a", 0, 1L, null, new byte[] {1})));
+        assertEquals(1_700_000_000_000L, task.mock.history().get(0).timestamp());
+    }
+
+    @Test
+    void copyModeLetsTheProducerSetTheTime() {
+        TestTask task = started(true, "fanin.timestamp.mode", "COPY");
+        task.put(List.of(record("pfx.a", 0, 1L, null, new byte[] {1})));
+        ProducerRecord<byte[], byte[]> out = task.mock.history().get(0);
+        assertNull(out.timestamp(), "COPY: no explicit timestamp, so the producer uses the time of the copy");
+        assertEquals("1700000000000", header(out, "fanin.source.timestamp"),
+            "the original time stays in the header in both modes");
+    }
+
+    @Test
+    void copyModeAlsoAppliesInJsonEnvelopeMode() {
+        TestTask task = started(true, "fanin.timestamp.mode", "COPY", "fanin.output.mode", "JSON_ENVELOPE");
+        task.put(List.of(record("pfx.a", 0, 1L, null, new byte[] {1})));
+        assertNull(task.mock.history().get(0).timestamp());
+    }
+
+    @Test
+    void timestampModeIsCaseInsensitive() {
+        assertEquals(FanInSinkConfig.TimestampMode.COPY,
+            new FanInSinkConfig(props("fanin.timestamp.mode", "copy")).timestampMode());
+        assertEquals(FanInSinkConfig.TimestampMode.SOURCE,
+            new FanInSinkConfig(props("fanin.timestamp.mode", "Source")).timestampMode());
+    }
+
+    @Test
+    void anUnknownTimestampModeIsRejected() {
+        assertThrows(ConfigException.class, () -> started(true, "fanin.timestamp.mode", "LATEST"));
+    }
+
+    @Test
+    void outputTimestampFollowsTheModeAndIgnoresMissingOrNegativeSourceTimes() {
+        FanInSinkConfig.TimestampMode source = FanInSinkConfig.TimestampMode.SOURCE;
+        FanInSinkConfig.TimestampMode copy = FanInSinkConfig.TimestampMode.COPY;
+        assertEquals(5L, FanInSinkTask.outputTimestamp(source, 5L));
+        assertEquals(0L, FanInSinkTask.outputTimestamp(source, 0L));
+        assertNull(FanInSinkTask.outputTimestamp(source, null));
+        assertNull(FanInSinkTask.outputTimestamp(source, -1L));
+        assertNull(FanInSinkTask.outputTimestamp(copy, 5L));
+        assertNull(FanInSinkTask.outputTimestamp(copy, null));
+    }
+
     @Test
     void existingHeadersArePreserved() {
         TestTask task = started(true);
