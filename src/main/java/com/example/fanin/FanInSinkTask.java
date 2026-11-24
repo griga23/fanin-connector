@@ -53,6 +53,7 @@ public class FanInSinkTask extends SinkTask {
     private String targetTopic;
     private FanInSinkConfig.OutputMode outputMode;
     private FanInSinkConfig.PartitioningMode partitioningMode;
+    private FanInSinkConfig.TimestampMode timestampMode;
     private Producer<byte[], byte[]> producer;
 
     /** First asynchronous send failure; sticky, so the task fails and offsets are never committed past it. */
@@ -73,6 +74,7 @@ public class FanInSinkTask extends SinkTask {
         targetTopic = config.targetTopic();
         outputMode = config.outputMode();
         partitioningMode = config.partitioningMode();
+        timestampMode = config.timestampMode();
 
         Optional<String> error = FanInSinkConfig.targetSubscriptionError(props);
         if (error.isPresent()) {
@@ -88,6 +90,7 @@ public class FanInSinkTask extends SinkTask {
         producer = createProducer(producerConfigs);
         log.info("Started fan-in task: target topic {}, output mode {}, partitioning {}",
             targetTopic, outputMode, partitioningMode);
+        log.info("Output record timestamp: {}", timestampMode);
     }
 
     /**
@@ -245,16 +248,20 @@ public class FanInSinkTask extends SinkTask {
         if (partitioningMode == FanInSinkConfig.PartitioningMode.SOURCE_PARTITION_HASH) {
             partition = selectPartition(record.topic(), record.kafkaPartition(), partitionCount());
         }
-        return new ProducerRecord<>(targetTopic, partition, outputTimestamp(record.timestamp()), key, outValue,
+        return new ProducerRecord<>(targetTopic, partition, outputTimestamp(timestampMode, record.timestamp()), key, outValue,
             headers);
     }
 
     /**
-     * Keeps the source record's timestamp, so readers that use the Kafka timestamp as event time (for example
-     * Flink's {@code $rowtime}) see the original time and not the time of the copy. Returns null, so the producer
-     * sets the current time, when the source record has no timestamp. KafkaProducer rejects negative values.
+     * In SOURCE mode keeps the source record's timestamp, so readers that use the Kafka timestamp as event time (for
+     * example Flink's {@code $rowtime}) see the original time and not the time of the copy. Returns null, so the
+     * producer sets the current time, in COPY mode and when the source record has no timestamp. KafkaProducer rejects
+     * negative values.
      */
-    static Long outputTimestamp(Long sourceTimestamp) {
+    static Long outputTimestamp(FanInSinkConfig.TimestampMode mode, Long sourceTimestamp) {
+        if (mode == FanInSinkConfig.TimestampMode.COPY) {
+            return null;
+        }
         return sourceTimestamp != null && sourceTimestamp >= 0 ? sourceTimestamp : null;
     }
 

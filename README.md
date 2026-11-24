@@ -47,6 +47,7 @@ Connector properties (all are in the connector's ConfigDef, so Confluent Cloud s
 | `fanin.target.api.secret` | password | required | The API secret. Marked sensitive. |
 | `fanin.output.mode` | enum | `HEADERS` | `HEADERS` or `JSON_ENVELOPE`, see below. |
 | `fanin.partitioning.mode` | enum | `SOURCE_PARTITION_HASH` | `SOURCE_PARTITION_HASH` or `KEY_HASH`, see below. |
+| `fanin.timestamp.mode` | enum | `SOURCE` | `SOURCE` keeps the source record's Kafka timestamp on the output record, `COPY` uses the time of the copy, see "Record timestamp". |
 | `fanin.start.timestamp` | long | `-1` (off) | Epoch milliseconds. Partitions without a committed offset start at the first record at or after this time instead of at the beginning, see "Where reading starts". |
 | `fanin.start.consumer.group` | string | `connect-<connector name>` | Consumer group used to find the partitions without a committed offset. Set it if the group has another name. |
 | `fanin.producer.*` | passthrough | none | Extra producer settings with the prefix removed, for example `fanin.producer.compression.type=lz4` or `fanin.producer.max.request.size=4194304`. They override the defaults below. |
@@ -74,10 +75,25 @@ Framework properties you must set:
   Base64 makes values a third bigger: raise `fanin.producer.max.request.size` and the target topic's
   `max.message.bytes` for large records.
 
-In both modes the output record keeps the Kafka timestamp of the source record, so a reader that uses the record
-timestamp as event time (Flink's `$rowtime`) sees the original time, not the time of the copy. A source record without
-a timestamp gets the time of the copy. If the target topic uses `message.timestamp.type=LogAppendTime`, the broker
-replaces the timestamp; the header `fanin.source.timestamp` still has the original value.
+### Record timestamp
+
+`fanin.timestamp.mode` decides which Kafka timestamp the output record gets. It applies in both output modes.
+
+- `SOURCE` (default): the output record keeps the Kafka timestamp of the source record, so a reader that uses the
+  record timestamp as event time (Flink's `$rowtime`) sees the original time, not the time of the copy. A source record
+  without a timestamp gets the time of the copy.
+- `COPY`: the output record gets the time of the copy, as before `SOURCE` existed. Use it when old data is read again
+  (for example after the connector was recreated) and must not be deleted at once, or when the readers should see the
+  time of arrival.
+
+The header `fanin.source.timestamp` always has the original value. If the target topic uses
+`message.timestamp.type=LogAppendTime`, the broker replaces the timestamp whatever the mode is.
+
+**Retention.** Kafka retention goes by record timestamp. In `SOURCE` mode a record older than the retention of the target
+topic (7 days by default on Confluent Cloud) is deleted a few minutes after it is written. Checked on Confluent Cloud:
+three records with a 30-day-old timestamp were copied with that timestamp, were there on one read, and were gone on the
+next read 2.5 minutes later. Reading old data again therefore leaves nothing behind in `SOURCE` mode. Use `COPY`, or raise the retention of the
+target topic above the age of the data.
 
 ### Partitioning
 
@@ -234,7 +250,8 @@ setup, key and value are `BYTES`, and Kafka headers are available once the metad
 
 ### Event time and late records
 
-`$rowtime` of the fan-in table is the source record's timestamp (see "Output modes"). One target partition gets
+With the default `fanin.timestamp.mode=SOURCE`, `$rowtime` of the fan-in table is the source record's timestamp (see
+"Record timestamp"). With `COPY` it is the time of the copy and the notes below on late records do not apply. One target partition gets
 records from many source partitions, so the fan-in topic is **not in event-time order**: a source topic that is behind,
 a new topic found about 4 minutes after it was created, or a task restart all put older records behind newer ones.
 

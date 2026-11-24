@@ -26,6 +26,7 @@ public class FanInSinkConfig extends AbstractConfig {
     public static final String TARGET_API_SECRET = "fanin.target.api.secret";
     public static final String OUTPUT_MODE = "fanin.output.mode";
     public static final String PARTITIONING_MODE = "fanin.partitioning.mode";
+    public static final String TIMESTAMP_MODE = "fanin.timestamp.mode";
     public static final String START_TIMESTAMP = "fanin.start.timestamp";
     public static final String START_CONSUMER_GROUP = "fanin.start.consumer.group";
     /** Prefix for pass-through producer settings, e.g. fanin.producer.compression.type. */
@@ -38,6 +39,8 @@ public class FanInSinkConfig extends AbstractConfig {
     public enum OutputMode { HEADERS, JSON_ENVELOPE }
 
     public enum PartitioningMode { SOURCE_PARTITION_HASH, KEY_HASH }
+
+    public enum TimestampMode { SOURCE, COPY }
 
     private static final String GROUP_TARGET = "Target cluster";
     private static final String GROUP_BEHAVIOUR = "Behaviour";
@@ -77,6 +80,16 @@ public class FanInSinkConfig extends AbstractConfig {
                 + "partition count of the target topic, which keeps per-source-partition ordering even for null "
                 + "keys. KEY_HASH: the default producer partitioner decides from the record key.",
             GROUP_BEHAVIOUR, 2, Width.MEDIUM, "Partitioning mode")
+        .define(TIMESTAMP_MODE, Type.STRING, TimestampMode.SOURCE.name(),
+            ConfigDef.CaseInsensitiveValidString.in(names(TimestampMode.values())),
+            Importance.MEDIUM,
+            "SOURCE: the output record keeps the Kafka timestamp of the source record, so a reader that uses the "
+                + "record timestamp as event time (Flink's $rowtime) sees the original time. A source record "
+                + "without a timestamp gets the time of the copy. COPY: the output record gets the time of the "
+                + "copy. Records older than the retention of the target topic are deleted soon after they are "
+                + "written in SOURCE mode, which matters when old data is read again. The header "
+                + "fanin.source.timestamp always has the original value.",
+            GROUP_BEHAVIOUR, 3, Width.MEDIUM, "Timestamp mode")
         .define(START_TIMESTAMP, Type.LONG, -1L, ConfigDef.Range.atLeast(-1L),
             Importance.MEDIUM,
             "Epoch milliseconds. Partitions that have no committed offset in the connector's consumer group start "
@@ -86,13 +99,13 @@ public class FanInSinkConfig extends AbstractConfig {
                 + "record at or after the value starts at its end. -1 turns this off and leaves the choice to "
                 + "auto.offset.reset. The source topics must be on the cluster of the target topic, because "
                 + "the lookup uses the target cluster settings.",
-            GROUP_BEHAVIOUR, 3, Width.MEDIUM, "Start timestamp")
+            GROUP_BEHAVIOUR, 4, Width.MEDIUM, "Start timestamp")
         .define(START_CONSUMER_GROUP, Type.STRING, "", Importance.LOW,
             "Consumer group of the connector, used to find which partitions have a committed offset. Empty means "
                 + "connect-<connector name>, the Kafka Connect default. Set it if the connector's group differs, "
                 + "for example when group.id is overridden. If the group cannot be found, the start timestamp is "
                 + "ignored and a warning is logged.",
-            GROUP_BEHAVIOUR, 4, Width.MEDIUM, "Start consumer group");
+            GROUP_BEHAVIOUR, 5, Width.MEDIUM, "Start consumer group");
 
     public FanInSinkConfig(Map<String, ?> originals) {
         super(CONFIG_DEF, originals, false);
@@ -132,6 +145,10 @@ public class FanInSinkConfig extends AbstractConfig {
             }
         }
         return admin;
+    }
+
+    public TimestampMode timestampMode() {
+        return TimestampMode.valueOf(getString(TIMESTAMP_MODE).toUpperCase(Locale.ROOT));
     }
 
     public PartitioningMode partitioningMode() {
