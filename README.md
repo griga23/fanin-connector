@@ -74,6 +74,11 @@ Framework properties you must set:
   Base64 makes values a third bigger: raise `fanin.producer.max.request.size` and the target topic's
   `max.message.bytes` for large records.
 
+In both modes the output record keeps the Kafka timestamp of the source record, so a reader that uses the record
+timestamp as event time (Flink's `$rowtime`) sees the original time, not the time of the copy. A source record without
+a timestamp gets the time of the copy. If the target topic uses `message.timestamp.type=LogAppendTime`, the broker
+replaces the timestamp; the header `fanin.source.timestamp` still has the original value.
+
 ### Partitioning
 
 - `SOURCE_PARTITION_HASH` (default): target partition = `murmur2(sourceTopic + "-" + sourcePartition)` modulo the number
@@ -226,6 +231,24 @@ and resources named `fanin-test-*`, and keep API secrets in process memory only.
 
 See "Flink verification" in `docs/FINDINGS.md` (kept local, not published): the table `fanin-test-out` appears in Flink without any
 setup, key and value are `BYTES`, and Kafka headers are available once the metadata column `headers` is added.
+
+### Event time and late records
+
+`$rowtime` of the fan-in table is the source record's timestamp (see "Output modes"). One target partition gets
+records from many source partitions, so the fan-in topic is **not in event-time order**: a source topic that is behind,
+a new topic found about 4 minutes after it was created, or a task restart all put older records behind newer ones.
+
+The default Confluent Cloud watermark is the largest event time seen in a Kafka partition minus 180 ms. With that
+default, window aggregations can drop records from a source that is behind. Set a watermark delay that covers the
+expected lag between source topics, for example:
+
+```sql
+ALTER TABLE `acme-fanin-out` MODIFY WATERMARK FOR `$rowtime` AS `$rowtime` - INTERVAL '5' MINUTE;
+```
+
+A larger delay keeps more records but makes window results arrive later. After a redeploy, which re-reads all
+topics, the old records are behind the watermark, so closed windows are not counted twice. Not tested on Confluent
+Cloud yet.
 
 ## Production readiness: what is not done
 

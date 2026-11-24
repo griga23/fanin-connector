@@ -167,6 +167,43 @@ class FanInSinkTaskTest {
         assertEquals("1700000000000", header(out, "fanin.source.timestamp"));
     }
 
+    // ---- timestamp ----
+
+    @Test
+    void sourceTimestampIsKeptOnOutputRecord() {
+        TestTask task = started(true);
+        task.put(List.of(record("pfx.a", 0, 1L, null, new byte[] {1})));
+        assertEquals(1_700_000_000_000L, task.mock.history().get(0).timestamp(),
+            "Flink reads the Kafka record timestamp as $rowtime, so the source time must be kept");
+    }
+
+    @Test
+    void sourceTimestampIsKeptInJsonEnvelopeMode() {
+        TestTask task = started(true, "fanin.output.mode", "JSON_ENVELOPE");
+        task.put(List.of(record("pfx.a", 0, 1L, null, new byte[] {1})));
+        assertEquals(1_700_000_000_000L, task.mock.history().get(0).timestamp());
+    }
+
+    @Test
+    void recordWithoutTimestampLetsProducerSetTheTime() {
+        TestTask task = started(true);
+        SinkRecord in = new SinkRecord("pfx.a", 0, Schema.OPTIONAL_BYTES_SCHEMA, null,
+            Schema.OPTIONAL_BYTES_SCHEMA, new byte[] {1}, 7L, null,
+            org.apache.kafka.common.record.TimestampType.NO_TIMESTAMP_TYPE);
+        task.put(List.of(in));
+        assertNull(task.mock.history().get(0).timestamp());
+    }
+
+    @Test
+    void negativeTimestampIsNotPassedToProducer() {
+        TestTask task = started(true);
+        SinkRecord in = new SinkRecord("pfx.a", 0, Schema.OPTIONAL_BYTES_SCHEMA, null,
+            Schema.OPTIONAL_BYTES_SCHEMA, new byte[] {1}, 7L, -5L,
+            org.apache.kafka.common.record.TimestampType.CREATE_TIME);
+        task.put(List.of(in));
+        assertNull(task.mock.history().get(0).timestamp(), "KafkaProducer rejects a negative timestamp");
+    }
+
     @Test
     void existingHeadersArePreserved() {
         TestTask task = started(true);
