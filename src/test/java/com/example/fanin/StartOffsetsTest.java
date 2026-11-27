@@ -58,6 +58,11 @@ class StartOffsetsTest {
         }
 
         @Override
+        public java.util.Set<String> topicNames() {
+            return java.util.Set.of();
+        }
+
+        @Override
         public void close() {
         }
     }
