@@ -49,15 +49,16 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
 
 /**
- * Local integration tests L1-L9 against the docker stack in docker/docker-compose.yml.
+ * Local integration tests L1-L17 against the docker stack in docker/docker-compose.yml.
  * Run with scripts/local-it.sh. Each test uses its own topics, target topic and connector.
  */
 @Tag("integration")
 @TestMethodOrder(MethodOrderer.MethodName.class)
 class LocalIT {
 
-    static final String BOOTSTRAP = "localhost:29092";
-    static final String CONNECT = "http://localhost:8083";
+    /** Overridable with -Dit.bootstrap and -Dit.connect, so a second stack can run next to the default one. */
+    static final String BOOTSTRAP = System.getProperty("it.bootstrap", "localhost:29092");
+    static final String CONNECT = System.getProperty("it.connect", "http://localhost:8083");
     static final String RUN = Long.toString(System.currentTimeMillis() % 100_000_000L, 36);
     static final ObjectMapper JSON = new ObjectMapper();
     static final HttpClient HTTP = HttpClient.newHttpClient();
@@ -892,6 +893,259 @@ class LocalIT {
             "COPY: the timestamp is the time of the copy, was " + r.timestamp() + " not in [" + before + ", " + after
                 + "]"));
         log("L16", "PASS: timestamp mode COPY gave the time of the copy on all 3 records, the header kept " + OLD_TS);
+    }
+
+    // ------------------------------------------------------------------ L17: fanin.control.topic
+
+    /** Records in the target per source topic and value prefix, for example {@code {a={s1=10, s4=10}}}. */
+    static Map<String, Map<String, Integer>> countsBySource(String target, String p, int atLeast, long timeoutMs) {
+        Map<String, Map<String, Integer>> counts = new TreeMap<>();
+        for (ConsumerRecord<byte[], byte[]> r : consume(target, atLeast, timeoutMs)) {
+            String topic = header(r, "fanin.source.topic").substring(p.length() + 1);
+            String value = new String(r.value(), StandardCharsets.UTF_8);
+            counts.computeIfAbsent(topic, k -> new TreeMap<>()).merge(value.substring(0, value.indexOf('-')), 1,
+                Integer::sum);
+        }
+        return counts;
+    }
+
+    static void control(String controlTopic, String topic, boolean add) throws Exception {
+        producer.send(new ProducerRecord<>(controlTopic, utf8(topic), add ? utf8("1") : null)).get();
+    }
+
+    @Test
+    void l17_controlTopicAddsAndRemovesTopicsWithoutRestart() throws Exception {
+        String p = prefix("l17", FanInSinkConfig.OutputMode.HEADERS);
+        String target = p + "-out";
+        String ctl = p + "-ctl";
+        for (String t : List.of("a", "b", "c")) {
+            createTopic(p + "." + t, 2);
+        }
+        createTopic(target, 3);
+        admin.createTopics(List.of(new NewTopic(ctl, 1, (short) 1)
+            .configs(Map.of("cleanup.policy", "compact")))).all().get();
+        control(ctl, p + ".a", true);
+        startConnector(p, regex(p), target, FanInSinkConfig.OutputMode.HEADERS, 1,
+            Map.of("fanin.control.topic", ctl, "fanin.control.add.start", "LATEST"));
+
+        // step 1: only a is allowed
+        for (String t : List.of("a", "b", "c")) {
+            produce(p + "." + t, "s1-", 10);
+        }
+        consume(target, 10, 60_000);
+        settle(5_000);
+        Map<String, Map<String, Integer>> step1 = countsBySource(target, p, 10, 5_000);
+        assertEquals(Map.of("a", Map.of("s1", 10)), step1);
+        log("L17/1", "PASS: allow a only, 10 records on each of a, b, c: target " + step1);
+
+        // step 2: add b; its 10 older records stay behind (LATEST), new ones arrive
+        control(ctl, p + ".b", true);
+        settle(5_000);
+        produce(p + ".b", "s2-", 10);
+        consume(target, 20, 60_000);
+        settle(5_000);
+        Map<String, Map<String, Integer>> step2 = countsBySource(target, p, 20, 5_000);
+        assertEquals(Map.of("a", Map.of("s1", 10), "b", Map.of("s2", 10)), step2);
+        log("L17/2", "PASS: add b, then 10 new records on b: target " + step2);
+
+        // step 3: remove a; later records of a are not forwarded
+        control(ctl, p + ".a", false);
+        settle(5_000);
+        produce(p + ".a", "s3-", 10);
+        produce(p + ".b", "s3-", 5);
+        consume(target, 25, 60_000);
+        settle(5_000);
+        Map<String, Map<String, Integer>> step3 = countsBySource(target, p, 25, 5_000);
+        assertEquals(Map.of("a", Map.of("s1", 10), "b", Map.of("s2", 10, "s3", 5)), step3);
+        log("L17/3", "PASS: remove a, then 10 records on a and 5 on b: target " + step3);
+
+        // step 4: add a again; only records after the new add arrive, not the 10 sent while it was removed
+        control(ctl, p + ".a", true);
+        settle(5_000);
+        produce(p + ".a", "s4-", 10);
+        consume(target, 35, 60_000);
+        settle(5_000);
+        Map<String, Map<String, Integer>> step4 = countsBySource(target, p, 35, 5_000);
+        assertEquals(Map.of("a", Map.of("s1", 10, "s4", 10), "b", Map.of("s2", 10, "s3", 5)), step4);
+        assertFalse(taskFailed(p));
+        log("L17/4", "PASS: add a again, then 10 records on a: target " + step4 + " (none of the 10 sent while "
+            + "a was removed; c never forwarded)");
+    }
+
+    /** Ledger metadata of the committed offsets of a topic, per partition. */
+    static Map<Integer, String> committedMetadata(String group, String topic) throws Exception {
+        Map<Integer, String> out = new TreeMap<>();
+        for (var e : admin.listConsumerGroupOffsets(group).partitionsToOffsetAndMetadata().get().entrySet()) {
+            if (e.getKey().topic().equals(topic)) {
+                out.put(e.getKey().partition(), e.getValue().metadata());
+            }
+        }
+        return out;
+    }
+
+    @Test
+    void l18_restartAfterRepeatedAddKeepsTheCommittedPosition() throws Exception {
+        // Records with a source timestamp older than the add time are written while the connector is paused. Then
+        // the add is written again and the task restarts. Without the ledger, the restart cuts at the add time,
+        // finds no record at or after it and starts at the end: the 10 old-timestamp records would be lost.
+        String p = prefix("l18", FanInSinkConfig.OutputMode.HEADERS);
+        String target = p + "-out";
+        String ctl = p + "-ctl";
+        createTopic(p + ".a", 2);
+        createTopic(target, 3);
+        admin.createTopics(List.of(new NewTopic(ctl, 1, (short) 1)
+            .configs(Map.of("cleanup.policy", "compact")))).all().get();
+        control(ctl, p + ".a", true);
+        startConnector(p, regex(p), target, FanInSinkConfig.OutputMode.HEADERS, 1,
+            Map.of("fanin.control.topic", ctl, "fanin.control.add.start", "LATEST"));
+
+        produce(p + ".a", "s1-", 10);
+        consume(target, 10, 60_000);
+        await("offsets of the 10 records committed", 60_000, () -> {
+            try {
+                return committedOn("connect-" + p, p + ".a") >= 10;
+            } catch (Exception e) {
+                return false;
+            }
+        });
+        Map<Integer, String> ledger = committedMetadata("connect-" + p, p + ".a");
+        assertEquals(2, ledger.size(), "committed " + ledger);
+        ledger.values().forEach(m -> assertTrue(m.startsWith("fanin.ctl:v1:allowed:"), "ledger " + ledger));
+        log("L18/1", "PASS: 10 records forwarded, committed ledger " + ledger);
+
+        HttpResponse<String> pause = http("PUT", "/connectors/" + p + "/pause", null);
+        assertTrue(pause.statusCode() < 300, "pause failed: " + pause.statusCode() + " " + pause.body());
+        await("connector paused", 60_000, () -> {
+            try {
+                return tasksState(p).contains("PAUSED");
+            } catch (Exception e) {
+                return false;
+            }
+        });
+        long old = System.currentTimeMillis() - 3_600_000L;
+        for (int i = 0; i < 10; i++) {
+            producer.send(new ProducerRecord<>(p + ".a", i % 2, old + i, null, utf8("s2-" + i)));
+        }
+        producer.flush();
+        control(ctl, p + ".a", true); // the same add again, as a script that rewrites the whole list would do
+
+        HttpResponse<String> restart = http("POST", "/connectors/" + p + "/restart?includeTasks=true&onlyFailed=false",
+            null);
+        assertTrue(restart.statusCode() < 300, "restart failed: " + restart.statusCode() + " " + restart.body());
+        HttpResponse<String> resume = http("PUT", "/connectors/" + p + "/resume", null);
+        assertTrue(resume.statusCode() < 300, "resume failed: " + resume.statusCode() + " " + resume.body());
+        await("tasks running after restart", 60_000, () -> allTasksRunning(p, 1));
+
+        consume(target, 20, 60_000);
+        settle(5_000);
+        Map<String, Map<String, Integer>> counts = countsBySource(target, p, 20, 5_000);
+        assertEquals(Map.of("a", Map.of("s1", 10, "s2", 10)), counts);
+        assertFalse(taskFailed(p));
+        log("L18/2", "PASS: repeated add and restart, 10 records with old timestamps written while paused: target "
+            + counts + " (no records skipped)");
+    }
+
+    @Test
+    void l19_removeIsTimeBased_recordsWrittenBeforeTheRemoveStillArrive() throws Exception {
+        // The connector is paused, so the task applies the remove only after the resume. The 10 records written
+        // before the remove are then still in the consumer lag. They must arrive; the 10 written after must not.
+        String p = prefix("l19", FanInSinkConfig.OutputMode.HEADERS);
+        String target = p + "-out";
+        String ctl = p + "-ctl";
+        createTopic(p + ".a", 2);
+        createTopic(target, 3);
+        admin.createTopics(List.of(new NewTopic(ctl, 1, (short) 1)
+            .configs(Map.of("cleanup.policy", "compact")))).all().get();
+        control(ctl, p + ".a", true);
+        startConnector(p, regex(p), target, FanInSinkConfig.OutputMode.HEADERS, 1,
+            Map.of("fanin.control.topic", ctl));
+
+        produce(p + ".a", "s1-", 10);
+        consume(target, 10, 60_000);
+        log("L19/1", "PASS: a allowed, 10 records forwarded");
+
+        HttpResponse<String> pause = http("PUT", "/connectors/" + p + "/pause", null);
+        assertTrue(pause.statusCode() < 300, "pause failed: " + pause.statusCode() + " " + pause.body());
+        await("connector paused", 60_000, () -> {
+            try {
+                return tasksState(p).contains("PAUSED");
+            } catch (Exception e) {
+                return false;
+            }
+        });
+        produce(p + ".a", "s2-", 10); // written before the remove
+        Thread.sleep(1_000);
+        control(ctl, p + ".a", false);
+        Thread.sleep(1_000);
+        produce(p + ".a", "s3-", 10); // written after the remove
+
+        HttpResponse<String> resume = http("PUT", "/connectors/" + p + "/resume", null);
+        assertTrue(resume.statusCode() < 300, "resume failed: " + resume.statusCode() + " " + resume.body());
+        await("tasks running after resume", 60_000, () -> allTasksRunning(p, 1));
+
+        consume(target, 20, 60_000);
+        settle(5_000);
+        Map<String, Map<String, Integer>> counts = countsBySource(target, p, 20, 5_000);
+        assertEquals(Map.of("a", Map.of("s1", 10, "s2", 10)), counts);
+        await("offsets committed with the remove cut", 60_000, () -> {
+            try {
+                Map<Integer, String> m = committedMetadata("connect-" + p, p + ".a");
+                return m.size() == 2 && m.values().stream()
+                    .allMatch(v -> v.matches("fanin\\.ctl:v2:removed:\\d+:\\d+"));
+            } catch (Exception e) {
+                return false;
+            }
+        });
+        Map<Integer, String> ledger = committedMetadata("connect-" + p, p + ".a");
+        assertFalse(taskFailed(p));
+        log("L19/2", "PASS: paused, 10 records, remove a, 10 records, resume: target " + counts
+            + " (the 10 written before the remove arrived, the 10 after did not); committed ledger " + ledger);
+    }
+
+    @Test
+    void l20_defaultEarliest_firstAddForwardsTheHistory_readdCuts() throws Exception {
+        // fanin.control.add.start is not set, so the default EARLIEST applies. Topic a has 10 records before the
+        // connector starts and is not on the list. Its first add forwards all of them. A re-add after a remove still
+        // starts at the add time: the records written while a was removed are not forwarded.
+        String p = prefix("l20", FanInSinkConfig.OutputMode.HEADERS);
+        String target = p + "-out";
+        String ctl = p + "-ctl";
+        createTopic(p + ".a", 2);
+        createTopic(target, 3);
+        admin.createTopics(List.of(new NewTopic(ctl, 1, (short) 1)
+            .configs(Map.of("cleanup.policy", "compact")))).all().get();
+        produce(p + ".a", "s1-", 10); // history, written before the add
+        startConnector(p, regex(p), target, FanInSinkConfig.OutputMode.HEADERS, 1,
+            Map.of("fanin.control.topic", ctl));
+        settle(10_000); // two offset commit intervals while a is not allowed
+        assertEquals(Map.of(), countsBySource(target, p, 0, 2_000), "a is not on the list yet");
+
+        // step 1: first add of a; the 10 older records arrive, and so do new ones
+        control(ctl, p + ".a", true);
+        settle(5_000);
+        produce(p + ".a", "s2-", 10);
+        consume(target, 20, 60_000);
+        settle(5_000);
+        Map<String, Map<String, Integer>> step1 = countsBySource(target, p, 20, 5_000);
+        assertEquals(Map.of("a", Map.of("s1", 10, "s2", 10)), step1);
+        log("L20/1", "PASS: 10 records on a before its first add, add a, 10 more: target " + step1
+            + " (the full history arrived)");
+
+        // step 2: remove a, 10 records, add a again, 10 records: the records written while removed stay behind
+        control(ctl, p + ".a", false);
+        settle(5_000);
+        produce(p + ".a", "s3-", 10);
+        settle(2_000);
+        control(ctl, p + ".a", true);
+        settle(5_000);
+        produce(p + ".a", "s4-", 10);
+        consume(target, 30, 60_000);
+        settle(5_000);
+        Map<String, Map<String, Integer>> step2 = countsBySource(target, p, 30, 5_000);
+        assertEquals(Map.of("a", Map.of("s1", 10, "s2", 10, "s4", 10)), step2);
+        assertFalse(taskFailed(p));
+        log("L20/2", "PASS: remove a, 10 records, add a again, 10 records: target " + step2
+            + " (none of the 10 sent while a was removed)");
     }
 
     @Test

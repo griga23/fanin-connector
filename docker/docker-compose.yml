@@ -1,18 +1,19 @@
 # Local test stack: single-node Apache Kafka (KRaft) + one distributed Connect worker.
 # Plugin is mounted from the Maven build output (run scripts/build.sh first).
-name: fanin-it
+# IT_PROJECT, IT_KAFKA_PORT and IT_CONNECT_PORT let a second stack run next to the default one.
+name: ${IT_PROJECT:-fanin-it}
 
 services:
   broker:
     image: apache/kafka:4.2.0
-    container_name: fanin-it-broker
+    container_name: ${IT_PROJECT:-fanin-it}-broker
     ports:
-      - "29092:29092"
+      - "${IT_KAFKA_PORT:-29092}:29092"
     environment:
       KAFKA_NODE_ID: 1
       KAFKA_PROCESS_ROLES: broker,controller
       KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:29092
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:9092,EXTERNAL://localhost:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://broker:9092,EXTERNAL://localhost:${IT_KAFKA_PORT:-29092}
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT
       KAFKA_CONTROLLER_QUORUM_VOTERS: 1@broker:9093
       KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
@@ -36,12 +37,12 @@ services:
 
   connect:
     image: apache/kafka:4.2.0
-    container_name: fanin-it-connect
+    container_name: ${IT_PROJECT:-fanin-it}-connect
     depends_on:
       broker:
         condition: service_healthy
     ports:
-      - "8083:8083"
+      - "${IT_CONNECT_PORT:-8083}:8083"
     entrypoint: ["/opt/kafka/bin/connect-distributed.sh", "/etc/connect/connect.properties"]
     environment:
       KAFKA_HEAP_OPTS: "-Xmx2g -Xms512m"
