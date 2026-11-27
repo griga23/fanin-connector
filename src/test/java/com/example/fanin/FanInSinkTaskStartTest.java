@@ -66,6 +66,11 @@ class FanInSinkTaskStartTest {
                 }
 
                 @Override
+                public java.util.Set<String> topicNames() {
+                    return lookup.topicNames();
+                }
+
+                @Override
                 public void close() {
                     lookupCloses++;
                 }

@@ -11,6 +11,7 @@ import org.apache.kafka.common.config.ConfigDef;
 import org.apache.kafka.common.config.ConfigDef.Importance;
 import org.apache.kafka.common.config.ConfigDef.Type;
 import org.apache.kafka.common.config.ConfigDef.Width;
+import org.apache.kafka.common.config.ConfigException;
 import org.apache.kafka.common.config.types.Password;
 
 /**
@@ -29,6 +30,20 @@ public class FanInSinkConfig extends AbstractConfig {
     public static final String TIMESTAMP_MODE = "fanin.timestamp.mode";
     public static final String START_TIMESTAMP = "fanin.start.timestamp";
     public static final String START_CONSUMER_GROUP = "fanin.start.consumer.group";
+    public static final String CONTROL_TOPIC = "fanin.control.topic";
+    public static final String CONTROL_ADD_START = "fanin.control.add.start";
+    public static final String CONTROL_MISSING_WARN_MS = "fanin.control.missing.warn.ms";
+    public static final String CONTROL_LOAD_TIMEOUT_MS = "fanin.control.load.timeout.ms";
+    public static final String CONTROL_MAX_LAG_MS = "fanin.control.max.lag.ms";
+    /**
+     * Smallest fanin.control.max.lag.ms. A healthy reader can look this far behind: it measures its position every
+     * {@link ControlReader#CHECK_MS}; the measurement starts after a poll (up to {@link ControlReader#POLL_TIMEOUT}),
+     * the end offset request can take up to {@link ControlReader#REQUEST_TIMEOUT}, and the reader reaches that end
+     * offset after one more poll. A smaller value would stall the task although the reader is fine.
+     */
+    static final long MIN_CONTROL_MAX_LAG_MS = ControlReader.CHECK_MS + 2 * ControlReader.POLL_TIMEOUT.toMillis()
+        + ControlReader.REQUEST_TIMEOUT.toMillis();
+
     /** Prefix for pass-through producer settings, e.g. fanin.producer.compression.type. */
     public static final String PRODUCER_PREFIX = "fanin.producer.";
 
@@ -42,8 +57,12 @@ public class FanInSinkConfig extends AbstractConfig {
 
     public enum TimestampMode { SOURCE, COPY }
 
+    /** Where a topic starts when the control topic adds it. */
+    public enum AddStart { LATEST, EARLIEST }
+
     private static final String GROUP_TARGET = "Target cluster";
     private static final String GROUP_BEHAVIOUR = "Behaviour";
+    private static final String GROUP_CONTROL = "Control topic";
 
     private static final ConfigDef CONFIG_DEF = new ConfigDef()
         .define(TARGET_TOPIC, Type.STRING, ConfigDef.NO_DEFAULT_VALUE, new ConfigDef.NonEmptyString(),
@@ -58,8 +77,9 @@ public class FanInSinkConfig extends AbstractConfig {
             GROUP_TARGET, 2, Width.LONG, "Target bootstrap servers")
         .define(TARGET_API_KEY, Type.STRING, ConfigDef.NO_DEFAULT_VALUE, new ConfigDef.NonEmptyString(),
             Importance.HIGH,
-            "Kafka API key used by the producer (SASL_SSL / PLAIN). Use a service account key that can only "
-                + "write to the target topic.",
+            "Kafka API key used by the producer (SASL_SSL / PLAIN). The offset lookups and the control topic "
+                + "reader use it too. It needs WRITE and DESCRIBE on the target topic, READ and DESCRIBE on the "
+                + "source topics and on the connect- consumer group, and READ and DESCRIBE on the control topic.",
             GROUP_TARGET, 3, Width.MEDIUM, "Target API key")
         .define(TARGET_API_SECRET, Type.PASSWORD, ConfigDef.NO_DEFAULT_VALUE,
             Importance.HIGH,
@@ -105,7 +125,49 @@ public class FanInSinkConfig extends AbstractConfig {
                 + "connect-<connector name>, the Kafka Connect default. Set it if the connector's group differs, "
                 + "for example when group.id is overridden. If the group cannot be found, the start timestamp is "
                 + "ignored and a warning is logged.",
-            GROUP_BEHAVIOUR, 5, Width.MEDIUM, "Start consumer group");
+            GROUP_BEHAVIOUR, 5, Width.MEDIUM, "Start consumer group")
+        .define(CONTROL_TOPIC, Type.STRING, "", Importance.MEDIUM,
+            "Compacted topic that lists the allowed source topics. Key: the topic name. A value that is not null "
+                + "adds the topic, a null value (tombstone) removes it. Records of topics that are not allowed are "
+                + "paused and dropped. Empty turns the feature off, and then every subscribed topic is forwarded.",
+            GROUP_CONTROL, 1, Width.LONG, "Control topic")
+        .define(CONTROL_ADD_START, Type.STRING, AddStart.EARLIEST.name(),
+            ConfigDef.CaseInsensitiveValidString.in(names(AddStart.values())),
+            Importance.MEDIUM,
+            "EARLIEST (default): an added topic continues from its committed offset or the consumer's reset "
+                + "policy, so the first add of an existing topic forwards its full history. "
+                + "LATEST: an added topic starts at the time of its add record, so older records are not forwarded. "
+                + "A topic that was removed and added again always starts at the time of the new add record.",
+            GROUP_CONTROL, 2, Width.MEDIUM, "Start of an added topic")
+        .define(CONTROL_MISSING_WARN_MS, Type.LONG, 3_600_000L, ConfigDef.Range.atLeast(0L),
+            Importance.LOW,
+            "A WARN line is logged once for every allowed name that has had no matching topic for this many "
+                + "milliseconds since it was added.",
+            GROUP_CONTROL, 3, Width.SHORT, "Missing topic warning (ms)")
+        .define(CONTROL_LOAD_TIMEOUT_MS, Type.LONG, 60_000L, ConfigDef.Range.atLeast(1L),
+            Importance.LOW,
+            "Maximum time in milliseconds for a task to read the control topic to its end when it starts. The task "
+                + "fails if it cannot read the control topic in this time.",
+            GROUP_CONTROL, 4, Width.SHORT, "Control topic load timeout (ms)")
+        .define(CONTROL_MAX_LAG_MS, Type.LONG, 60_000L, FanInSinkConfig::validateMaxLag,
+            Importance.LOW,
+            "If the task has not read the control topic to its end for this many milliseconds (for example because "
+                + "the control topic cannot be reached), it stops forwarding: it pauses all its partitions and drops "
+                + "the records it gets, until the reader has caught up again. A remove takes effect within this time "
+                + "even when the control topic cannot be read. Minimum " + MIN_CONTROL_MAX_LAG_MS + ": a healthy "
+                + "reader measures its position only every few seconds.",
+            GROUP_CONTROL, 5, Width.SHORT, "Control topic maximum lag (ms)");
+
+    private static void validateMaxLag(String name, Object value) {
+        if (value == null || (Long) value < MIN_CONTROL_MAX_LAG_MS) {
+            throw new ConfigException(name, value, "Must be at least " + MIN_CONTROL_MAX_LAG_MS + " ms. The control "
+                + "reader measures its position every " + ControlReader.CHECK_MS + " ms, and one measurement can take "
+                + "up to " + (MIN_CONTROL_MAX_LAG_MS - ControlReader.CHECK_MS) + " ms (two polls of "
+                + ControlReader.POLL_TIMEOUT.toMillis() + " ms and an end offset request of up to "
+                + ControlReader.REQUEST_TIMEOUT.toMillis() + " ms). A smaller value stalls the task although the "
+                + "reader is healthy.");
+        }
+    }
 
     public FanInSinkConfig(Map<String, ?> originals) {
         super(CONFIG_DEF, originals, false);
@@ -145,6 +207,42 @@ public class FanInSinkConfig extends AbstractConfig {
             }
         }
         return admin;
+    }
+
+    /** The control topic, or empty if the feature is off. */
+    public Optional<String> controlTopic() {
+        String topic = getString(CONTROL_TOPIC);
+        return topic == null || topic.isBlank() ? Optional.empty() : Optional.of(topic.trim());
+    }
+
+    public AddStart controlAddStart() {
+        return AddStart.valueOf(getString(CONTROL_ADD_START).toUpperCase(Locale.ROOT));
+    }
+
+    public long controlMissingWarnMs() {
+        return getLong(CONTROL_MISSING_WARN_MS);
+    }
+
+    public long controlLoadTimeoutMs() {
+        return getLong(CONTROL_LOAD_TIMEOUT_MS);
+    }
+
+    public long controlMaxLagMs() {
+        return getLong(CONTROL_MAX_LAG_MS);
+    }
+
+    /**
+     * Settings of the control topic reader: the connection settings of the target cluster, byte array
+     * deserializers and no consumer group. The reader uses assign(), so it needs only READ on the control topic.
+     */
+    public Map<String, Object> controlConsumerConfigs() {
+        Map<String, Object> consumer = adminConfigs();
+        consumer.put("key.deserializer", "org.apache.kafka.common.serialization.ByteArrayDeserializer");
+        consumer.put("value.deserializer", "org.apache.kafka.common.serialization.ByteArrayDeserializer");
+        consumer.put("enable.auto.commit", "false");
+        consumer.put("auto.offset.reset", "earliest");
+        consumer.put("isolation.level", "read_committed");
+        return consumer;
     }
 
     public TimestampMode timestampMode() {
@@ -197,12 +295,46 @@ public class FanInSinkConfig extends AbstractConfig {
                 return Optional.of("topics.regex is not a valid regular expression: " + e.getDescription());
             }
         }
+        String control = props.get(CONTROL_TOPIC);
+        if (control != null && !control.isBlank()) {
+            if (target.trim().equals(control.trim())) {
+                return Optional.of("The control topic '" + control.trim() + "' is the target topic. Every forwarded "
+                    + "record would be read as a control record. Use a separate control topic.");
+            }
+            Optional<String> controlError = subscriptionContains(props, control.trim(), "control topic");
+            if (controlError.isPresent()) {
+                return controlError;
+            }
+        }
         String topics = props.get(TOPICS);
         if (topics != null) {
             for (String topic : topics.split(",")) {
                 if (topic.trim().equals(target)) {
                     return Optional.of("topics contains the target topic '" + target
                         + "'. The connector would consume its own output.");
+                }
+            }
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<String> subscriptionContains(Map<String, String> props, String topic, String what) {
+        String regex = props.get(TOPICS_REGEX);
+        if (regex != null && !regex.isBlank()) {
+            try {
+                if (Pattern.compile(regex).matcher(topic).matches()) {
+                    return Optional.of("topics.regex '" + regex + "' matches the " + what + " '" + topic
+                        + "'. Its records would be forwarded. Choose names that do not overlap.");
+                }
+            } catch (PatternSyntaxException e) {
+                return Optional.empty(); // reported for the target topic
+            }
+        }
+        String topics = props.get(TOPICS);
+        if (topics != null) {
+            for (String t : topics.split(",")) {
+                if (t.trim().equals(topic)) {
+                    return Optional.of("topics contains the " + what + " '" + topic + "'.");
                 }
             }
         }

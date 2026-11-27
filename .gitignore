@@ -9,3 +9,4 @@ cc-state/
 *.iml
 .vscode/
 docs/
+__pycache__/

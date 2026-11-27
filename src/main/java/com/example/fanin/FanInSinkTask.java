@@ -11,6 +11,7 @@ import java.util.Optional;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.LongSupplier;
 import org.apache.kafka.clients.admin.Admin;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.producer.KafkaProducer;
 import org.apache.kafka.clients.producer.Producer;
@@ -63,6 +64,8 @@ public class FanInSinkTask extends SinkTask {
     private String consumerGroup;
     private String clientId;
     private StartOffsets.Lookup startLookup;
+    /** The control topic feature; null when fanin.control.topic is not set. */
+    private ControlCoordinator control;
 
     private int cachedPartitionCount;
     private long partitionCountFetchedAt;
@@ -91,25 +94,49 @@ public class FanInSinkTask extends SinkTask {
         log.info("Started fan-in task: target topic {}, output mode {}, partitioning {}",
             targetTopic, outputMode, partitioningMode);
         log.info("Output record timestamp: {}", timestampMode);
+        Optional<String> controlTopic = config.controlTopic();
+        if (controlTopic.isPresent()) {
+            control = ControlCoordinator.start(config, props, controlTopic.get(), context, this::lookup,
+                this::createControlReader, this::warn, () -> clock.getAsLong(), startTimestamp, consumerGroup);
+        }
+    }
+
+    /** Overridable so tests can inject a reader on a MockConsumer. */
+    ControlReader createControlReader(String topic, ControlState state) {
+        Map<String, Object> configs = config.controlConsumerConfigs();
+        configs.putIfAbsent("client.id", clientId + "-control");
+        return new ControlReader(new KafkaConsumer<>(configs), topic, state, clock);
+    }
+
+    /** The control state, or null if the feature is off. For tests. */
+    ControlState controlState() {
+        return control == null ? null : control.state();
+    }
+
+    /** Logs a warning about the control list. Overridable so tests can see the message. */
+    void warn(String message) {
+        log.warn("{}", message);
     }
 
     /**
      * Moves partitions that have no committed offset to the configured start timestamp. Runs when partitions are
      * assigned, which includes every new topic and every rebalance. Partitions with a committed offset are never
      * touched. A failure is logged and the task carries on with the consumer's own reset policy: stopping would not
-     * help, and the worst case is the behaviour without this setting.
+     * help, and the worst case is the behaviour without this setting. With the control topic, the
+     * {@link ControlCoordinator} decides the start position instead, including the start timestamp.
      */
     @Override
     public void open(Collection<TopicPartition> partitions) {
+        if (control != null && !partitions.isEmpty()) {
+            control.onOpen(partitions);
+            return;
+        }
         if (startTimestamp < 0 || partitions.isEmpty()) {
             return;
         }
         try {
-            if (startLookup == null) {
-                startLookup = createStartLookup(config.adminConfigs());
-            }
             Map<TopicPartition, Long> moves =
-                StartOffsets.compute(startLookup, consumerGroup, partitions, startTimestamp);
+                StartOffsets.compute(lookup(), consumerGroup, partitions, startTimestamp);
             if (!moves.isEmpty()) {
                 context.offset(moves);
                 log.info("Start timestamp {}: moved {} of {} assigned partitions without a committed offset",
@@ -133,6 +160,13 @@ public class FanInSinkTask extends SinkTask {
         return new AdminLookup(Admin.create(configs));
     }
 
+    private StartOffsets.Lookup lookup() {
+        if (startLookup == null) {
+            startLookup = createStartLookup(config.adminConfigs());
+        }
+        return startLookup;
+    }
+
     /** Overridable so tests can inject a MockProducer. */
     Producer<byte[], byte[]> createProducer(Map<String, Object> producerConfigs) {
         return new KafkaProducer<>(producerConfigs);
@@ -141,7 +175,13 @@ public class FanInSinkTask extends SinkTask {
     @Override
     public void put(Collection<SinkRecord> records) {
         checkSendFailure();
+        if (control != null) {
+            control.beforePut();
+        }
         for (SinkRecord record : records) {
+            if (control != null && !control.accept(record)) {
+                continue;
+            }
             ProducerRecord<byte[], byte[]> out = toProducerRecord(record);
             if (log.isDebugEnabled()) {
                 log.debug("Forwarding {}-{}@{}", record.topic(), record.kafkaPartition(), record.kafkaOffset());
@@ -154,13 +194,30 @@ public class FanInSinkTask extends SinkTask {
             } catch (KafkaException e) {
                 throw new ConnectException("Producer error: " + e.getMessage(), e);
             }
+            if (control != null) {
+                control.forwarded(record);
+            }
+        }
+        if (control != null) {
+            control.afterPut(records);
         }
     }
 
     @Override
+    public void close(Collection<TopicPartition> partitions) {
+        if (control != null) {
+            control.onClose(partitions);
+        }
+    }
+
+    /**
+     * Flushes the producer, then returns the offsets to commit. With the control topic, the
+     * {@link ControlCoordinator} holds some offsets back and adds the ledger of each partition to its metadata.
+     */
+    @Override
     public Map<TopicPartition, OffsetAndMetadata> preCommit(Map<TopicPartition, OffsetAndMetadata> currentOffsets) {
         flushAndCheck();
-        return currentOffsets;
+        return control == null ? currentOffsets : control.preCommit(currentOffsets);
     }
 
     @Override
@@ -170,6 +227,9 @@ public class FanInSinkTask extends SinkTask {
 
     @Override
     public void stop() {
+        if (control != null) {
+            control.stop();
+        }
         StartOffsets.Lookup lookup = startLookup;
         startLookup = null;
         if (lookup != null) {
