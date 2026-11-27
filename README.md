@@ -43,13 +43,18 @@ Connector properties (all are in the connector's ConfigDef, so Confluent Cloud s
 |---|---|---|---|
 | `fanin.target.topic` | string | required | The single output topic. Must not match the subscription. |
 | `fanin.target.bootstrap.servers` | string | required | Bootstrap endpoint of the cluster with the target topic, `host:port`. |
-| `fanin.target.api.key` | string | required | Kafka API key of the producer (SASL_SSL / PLAIN). Use a service account that can only write to the target topic. |
+| `fanin.target.api.key` | string | required | Kafka API key of the producer (SASL_SSL / PLAIN). The offset lookups and the control topic reader use it too. See "Deploy on Confluent Cloud" for the ACLs it needs. |
 | `fanin.target.api.secret` | password | required | The API secret. Marked sensitive. |
 | `fanin.output.mode` | enum | `HEADERS` | `HEADERS` or `JSON_ENVELOPE`, see below. |
 | `fanin.partitioning.mode` | enum | `SOURCE_PARTITION_HASH` | `SOURCE_PARTITION_HASH` or `KEY_HASH`, see below. |
 | `fanin.timestamp.mode` | enum | `SOURCE` | `SOURCE` keeps the source record's Kafka timestamp on the output record, `COPY` uses the time of the copy, see "Record timestamp". |
 | `fanin.start.timestamp` | long | `-1` (off) | Epoch milliseconds. Partitions without a committed offset start at the first record at or after this time instead of at the beginning, see "Where reading starts". |
 | `fanin.start.consumer.group` | string | `connect-<connector name>` | Consumer group used to find the partitions without a committed offset. Set it if the group has another name. |
+| `fanin.control.topic` | string | empty (off) | Compacted allow list of source topics, see "Control topic (allow list)". |
+| `fanin.control.add.start` | enum | `EARLIEST` | `EARLIEST` or `LATEST`: where a topic starts when it is added. `EARLIEST` forwards the full history of a topic on its first add; `LATEST` starts at the time of the add record. A re-add after a remove always starts at the add time. |
+| `fanin.control.missing.warn.ms` | long | `3600000` | Time after an add before a WARN line for a listed name without a topic. |
+| `fanin.control.load.timeout.ms` | long | `60000` | Maximum time for a task to read the control topic at start. |
+| `fanin.control.max.lag.ms` | long | `60000` | If the control reader is behind for longer than this, the task pauses all partitions and forwards nothing until it catches up. Minimum `17000`. |
 | `fanin.producer.*` | passthrough | none | Extra producer settings with the prefix removed, for example `fanin.producer.compression.type=lz4` or `fanin.producer.max.request.size=4194304`. They override the defaults below. |
 
 Producer defaults: `acks=all`, `enable.idempotence=true`, `security.protocol=SASL_SSL`, `sasl.mechanism=PLAIN`
@@ -102,6 +107,21 @@ target topic above the age of the data.
   even with null keys. The partition count is cached and refreshed every 5 minutes. Adding partitions to the target
   topic changes the mapping from then on.
 - `KEY_HASH`: the default producer partitioner decides from the record key. Order is per key, and null keys are spread.
+
+## Control topic (allow list)
+
+Optional. Set `fanin.control.topic` to a compacted topic. Its records add (value not null) and remove (null value)
+source topics by name, without a restart. Topics that are not on the list are paused, and their records are dropped.
+An added topic continues at its committed offset, or at the beginning (or at `fanin.start.timestamp`) if it has
+none (`fanin.control.add.start=EARLIEST`, the default), so the first add of an existing topic forwards its full history.
+With `LATEST` an added topic starts at the time of its add record. A removed topic
+stops at the time of its remove record: records with a timestamp before the remove time are still forwarded, also
+when they are read later, and the partitions are paused once they reach the first record at or after that time. A
+topic that is removed and added again always starts at the new add time. One WARN line is logged for a listed name without a topic
+after `fanin.control.missing.warn.ms`. The control topic must have exactly 1 partition and must not be the target
+topic. Each committed offset of a source partition carries the applied control state in its metadata, so a
+restart or a rebalance does not move a cut that was already applied. Design, record format, limits and test
+results: `docs/CONTROL-TOPIC.md`. Scripts for the Confluent Cloud tests: `scripts/cloud-test/control/README.md`.
 
 ## Delivery semantics
 
@@ -198,8 +218,13 @@ TESTS='LocalIT#l1*+l7*' scripts/local-it.sh
 
 ## Deploy on Confluent Cloud
 
-1. Create a service account and a Kafka API key for the cluster. Needed ACLs: read and describe on the source topic
-   prefix, read on the consumer group prefix `connect-`, write and describe on the target topic.
+1. Create a service account and a Kafka API key for the cluster. The connector's own consumer, the producer, the
+   offset lookups (`fanin.start.timestamp`, control topic) and the control topic reader use this key. Needed ACLs:
+   - READ and DESCRIBE on the source topic prefix (DESCRIBE is also needed for the topic listing of the
+     missing-topic check),
+   - READ and DESCRIBE on the consumer group prefix `connect-`,
+   - WRITE and DESCRIBE on the target topic,
+   - with `fanin.control.topic`: READ and DESCRIBE on the control topic. The reader uses no consumer group.
 2. Upload the plugin (choose the cloud of your cluster; the default is aws):
    ```
    confluent connect custom-plugin create <name> --plugin-file target/components/packages/example-fanin-connector-0.1.0.zip \
